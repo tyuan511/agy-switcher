@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Validate version and bilingual release notes
+        run: python3 .github/scripts/release.py check-notes "$GITHUB_REF_NAME" --repository "$GITHUB_REPOSITORY"
+      - name: Run Swift unit tests
+        run: swift test
+      - name: Build universal macOS app
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          xcodebuild -project AGYSwitcher.xcodeproj -scheme AGYSwitcher \
+            -configuration Release -destination 'generic/platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/build" CODE_SIGNING_ALLOWED=NO \
+            'ARCHS=arm64 x86_64' ONLY_ACTIVE_ARCH=NO \
+            SWIFT_ACTIVE_COMPILATION_CONDITIONS=AGY_RELEASE_BUILD \
+            MARKETING_VERSION="$version" CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" build
+          app="$RUNNER_TEMP/build/Build/Products/Release/AGY Switcher.app"
+          info="$app/Contents/Info.plist"
+          test "$(plutil -extract CFBundleShortVersionString raw "$info")" = "$version"
+          test "$(plutil -extract CFBundleVersion raw "$info")" = "$GITHUB_RUN_NUMBER"
+          executable="$(plutil -extract CFBundleExecutable raw "$info")"
+          lipo "$app/Contents/MacOS/$executable" -verify_arch arm64
+          lipo "$app/Contents/MacOS/$executable" -verify_arch x86_64
+      - name: Sign and notarize the disk image
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          bash .github/scripts/package-macos.sh \
+            "$RUNNER_TEMP/build/Build/Products/Release/AGY Switcher.app" \
+            "$RUNNER_TEMP/release/AGY-Switcher-$GITHUB_REF_NAME-macOS-universal.dmg"
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          asset="AGY-Switcher-$tag-macOS-universal.dmg"
+          notes="docs/release/$tag.md"
+          title="AGY Switcher $tag"
+          if release="$(gh release view "$tag" --json isDraft,assets)"; then
+            if [[ "$(jq -r '.isDraft' <<< "$release")" == false ]]; then
+              jq -e --arg asset "$asset" '.assets | any(.name == $asset and .state == "uploaded")' \
+                <<< "$release" > /dev/null
+              echo "Release $tag is already published."
+              exit 0
+            fi
+          else
+            gh release create "$tag" --verify-tag --draft --title "$title" --notes-file "$notes"
+          fi
+          gh release upload "$tag" "$RUNNER_TEMP/release/$asset" --clobber
+          gh release edit "$tag" --verify-tag --draft=false --title "$title" --notes-file "$notes"
