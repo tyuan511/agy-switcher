@@ -30,7 +30,9 @@ struct SettingsPage: View {
                 }
                 Toggle(isOn: Binding(get: {
                     loginItemStatus == .enabled || loginItemStatus == .requiresApproval
-                }, set: setLaunchAtLogin)) {
+                }, set: { enabled in
+                    setLaunchAtLogin(enabled)
+                })) {
                     Text(language.text("登录时启动"))
                     Text(language.text("登录 macOS 后驻留菜单栏，账号管理窗口按需打开。"))
                 }
