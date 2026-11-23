@@ -254,13 +254,22 @@ private struct QuotaUsageRow: View {
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(primary ? .subheadline.weight(.semibold) : .subheadline)
-                    .foregroundStyle(primary ? .primary : .secondary)
-                if let detail {
-                    Text(detail).font(.caption).foregroundStyle(.secondary)
+            if primary {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                    if let detail {
+                        Text(detail).font(.caption).foregroundStyle(.secondary)
+                    }
                 }
+            } else if let detail {
+                Text("\(Text(title).font(.subheadline))\(Text(" · \(detail)").font(.caption))")
+                    .foregroundStyle(.secondary)
+            } else {
+                Text(title)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
             }
             Spacer(minLength: 6)
             Text(language.text("剩余 \(percent)"))

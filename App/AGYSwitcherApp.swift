@@ -262,8 +262,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         accountsWindowRequested = false
         DispatchQueue.main.async { [self] in
             prepareToShowAccountsWindow()
+            NSApp.activate(ignoringOtherApps: true)
             openAccountsWindow()
-            NSApplication.shared.activate()
+            DispatchQueue.main.async { [self] in
+                activateAccountsWindow()
+            }
+        }
+    }
+
+    private func activateAccountsWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        let window = NSApp.windows.first {
+            $0.identifier?.rawValue.hasPrefix("accounts") == true
+                || (!($0 is NSPanel) && $0 != demoBackdrop && $0.canBecomeKey)
+        }
+        if let window {
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            window.makeKeyAndOrderFront(nil)
         }
     }
 
@@ -275,7 +290,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let wasActive = application.isActive
         if application.setActivationPolicy(policy), wasActive {
-            application.activate()
+            application.activate(ignoringOtherApps: true)
         }
     }
 
