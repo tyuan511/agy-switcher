@@ -4,6 +4,7 @@ import SwiftUI
 struct SettingsPage: View {
     @Bindable var preferences: AppPreferences
     let updater: AppUpdater
+    let model: AccountsModel
     @Environment(\.appLanguage) private var language
     @Environment(\.appearsActive) private var appearsActive
     @State private var loginItemStatus = SMAppService.mainApp.status
@@ -11,7 +12,7 @@ struct SettingsPage: View {
 
     var body: some View {
         Form {
-            Section {
+            Section(language.text("通用")) {
                 Picker(language.text("语言"), selection: $preferences.language) {
                     ForEach(AppLanguage.allCases, id: \.self) { option in
                         Text(verbatim: option.name).tag(option)
@@ -22,7 +23,6 @@ struct SettingsPage: View {
                         Text(language.text(option.title)).tag(option)
                     }
                 }
-                Toggle(language.text("隐藏 Dock 图标"), isOn: $preferences.hideDockIcon)
                 Picker(language.text("关闭窗口时"), selection: $preferences.windowCloseBehavior) {
                     ForEach(AppPreferences.WindowCloseBehavior.allCases, id: \.self) { option in
                         Text(language.text(option.title)).tag(option)
@@ -42,11 +42,12 @@ struct SettingsPage: View {
                     }
                 }
                 if let loginItemError {
-                    Text(language.text("无法更新登录项。\(loginItemError)"))
-                        .foregroundStyle(.secondary)
+                    Label(language.text("无法更新登录项。\(loginItemError)"), systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
                 }
             }
-            Section {
+            Section(language.text("配额刷新")) {
                 Toggle(isOn: $preferences.automaticallyRefreshQuota) {
                     Text(language.text("自动刷新配额"))
                     Text(language.text("打开账号管理或菜单栏弹窗时，按设定间隔检查并刷新配额。"))
@@ -60,6 +61,7 @@ struct SettingsPage: View {
                 }
                 .disabled(!preferences.automaticallyRefreshQuota)
             }
+            AccountTransferSettings(model: model)
             if updater.enabled {
                 UpdateSettings(updater: updater)
             }

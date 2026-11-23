@@ -10,6 +10,7 @@ enum AGYError: LocalizedError, Equatable {
     case noQuota
     case serviceRejected(Int)
     case keychain(Int32)
+    case keychainInteractionRequired
     case unsupportedCredential
     case credentialChanged
     case switchVerification
@@ -18,6 +19,9 @@ enum AGYError: LocalizedError, Equatable {
     case antigravityQuitFailed
     case antigravityQuitTimedOut
     case antigravityLaunchFailed
+    case invalidBackup
+    case emptyBackup
+    case backupWriteFailed
 
     var errorDescription: String? { description(in: .simplifiedChinese) }
 
@@ -32,6 +36,7 @@ enum AGYError: LocalizedError, Equatable {
         case .noQuota: language.text("服务暂未返回可用的配额。")
         case .serviceRejected(let status): language.text("服务请求失败（HTTP \(String(status))）。")
         case .keychain(let status): language.text("无法访问钥匙串（\(String(status))）。")
+        case .keychainInteractionRequired: language.text("需要授权访问 macOS 钥匙串。请在系统弹窗中选择「始终允许」以避免重复提示。")
         case .unsupportedCredential: language.text("检测到非个人账号凭据或未知的凭据格式。")
         case .credentialChanged: language.text("客户端凭据刚刚发生变化，请重试。")
         case .switchVerification: language.text("写入后的客户端凭据验证失败。")
@@ -40,6 +45,9 @@ enum AGYError: LocalizedError, Equatable {
         case .antigravityQuitFailed: language.text("无法请求 Antigravity 退出。")
         case .antigravityQuitTimedOut: language.text("等待 Antigravity 退出超时。")
         case .antigravityLaunchFailed: language.text("Antigravity 的新进程未能启动。")
+        case .invalidBackup: language.text("备份文件无效或密码不正确。")
+        case .emptyBackup: language.text("备份中没有任何账号。")
+        case .backupWriteFailed: language.text("无法写入备份文件。")
         }
     }
 }

@@ -41,7 +41,6 @@ final class AppPreferences {
     private enum Key {
         static let language = "appLanguage"
         static let appearance = "appAppearance"
-        static let hideDockIcon = "hideDockIcon"
         static let windowCloseBehavior = "windowCloseBehavior"
         static let automaticallyRefreshQuota = "automaticallyRefreshQuota"
         static let quotaRefreshInterval = "quotaRefreshIntervalMinutes"
@@ -55,10 +54,6 @@ final class AppPreferences {
 
     var appearance: Appearance {
         didSet { defaults.set(appearance.rawValue, forKey: Key.appearance) }
-    }
-
-    var hideDockIcon: Bool {
-        didSet { defaults.set(hideDockIcon, forKey: Key.hideDockIcon) }
     }
 
     var windowCloseBehavior: WindowCloseBehavior {
@@ -77,14 +72,9 @@ final class AppPreferences {
         self.defaults = defaults
         language = defaults.string(forKey: Key.language).flatMap(AppLanguage.init(rawValue:)) ?? .simplifiedChinese
         appearance = defaults.string(forKey: Key.appearance).flatMap(Appearance.init(rawValue:)) ?? .system
-        hideDockIcon = Self.storedHideDockIcon(in: defaults)
         windowCloseBehavior = Self.storedWindowCloseBehavior(in: defaults)
         automaticallyRefreshQuota = defaults.object(forKey: Key.automaticallyRefreshQuota) as? Bool ?? true
         quotaRefreshInterval = QuotaRefreshInterval(rawValue: defaults.integer(forKey: Key.quotaRefreshInterval)) ?? .fiveMinutes
-    }
-
-    static func storedHideDockIcon(in defaults: UserDefaults = .standard) -> Bool {
-        defaults.bool(forKey: Key.hideDockIcon)
     }
 
     static func storedWindowCloseBehavior(in defaults: UserDefaults = .standard) -> WindowCloseBehavior {

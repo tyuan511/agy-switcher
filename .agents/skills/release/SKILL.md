@@ -39,5 +39,5 @@ description: 准备或发布 AGY Switcher macOS 新版本。用于“发版”�
    git push --atomic origin HEAD:refs/heads/main refs/tags/vX.Y.Z:refs/tags/vX.Y.Z
    ```
 
-3. 用 `gh run list --workflow release.yml --branch vX.Y.Z --event push` 等待本次 run 出现，核对其提交，再用 `gh run watch RUN_ID --exit-status` 跟到结束。CI 从 tag 读取说明，在签名和公证后上传 DMG，再公开 Release。通过 `gh release view vX.Y.Z --json url,isDraft,body,assets` 确认说明、中文链接、DMG 和发布状态，返回 Release 链接。
+3. 用 `gh run list --workflow release.yml --branch vX.Y.Z --event push` 等待本次 run 出现，核对其提交，再用 `gh run watch RUN_ID --exit-status` 跟到结束。CI 从 tag 读取说明，分别为 Apple Silicon 和 Intel 构建、签名和公证 DMG，两份都上传后再公开 Release。通过 `gh release view vX.Y.Z --json url,isDraft,body,assets` 确认说明、中文链接、`-macOS-arm64.dmg` 和 `-macOS-amd64.dmg` 附件及发布状态，返回 Release 链接。
 4. 失败后用 `gh run view RUN_ID --log-failed` 定位。签名配置或服务端的临时问题修正后，重跑同一个 run。若需要改 tag 里的代码或说明，修正后发新版本。保留现有 tag 和已公开的产物。

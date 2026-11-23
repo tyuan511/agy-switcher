@@ -22,7 +22,7 @@ struct AccountFlowTests {
         defer { fixture.cleanUp() }
         let service = fixture.service()
         _ = try await service.saveAuthorization(identity: sample, credential: makeCredential("old"))
-        let cached = try await service.refreshQuota(for: sample.id)
+        let cached = try await service.refreshQuota(for: sample.id, interaction: .allowed)
         let renamed = GoogleIdentity(id: sample.id, email: "updated@example.com", name: nil)
         _ = try await service.saveAuthorization(identity: renamed, credential: makeCredential("new"))
 
@@ -40,7 +40,7 @@ struct AccountFlowTests {
         _ = try await service.saveAuthorization(identity: other, credential: makeCredential("other"))
         try await service.switchAccount(to: sample.id)
 
-        let refreshed = try await service.refreshQuota(for: other.id)
+        let refreshed = try await service.refreshQuota(for: other.id, interaction: .allowed)
         #expect(refreshed.quota?.entries.first?.fraction == 0.75)
         #expect(try await service.activeAccount() == .managed(sample.id))
         #expect(try fixture.system.read().map(ClientCredentials.decode)?.token.refreshToken == "refresh-alex")
@@ -52,6 +52,7 @@ struct AccountFlowTests {
         defer { fixture.cleanUp() }
         let renewals = Mutex(0)
         let quota = Mutex([String]())
+        let vaultAccesses = Mutex([KeychainInteraction]())
         let service = fixture.service(
             oauth: GoogleOAuth { request in
                 #expect(request.url?.host == "oauth2.googleapis.com")
@@ -63,13 +64,17 @@ struct AccountFlowTests {
                 quota.withLock { $0.append(authorization) }
                 if authorization == "Bearer access-old" { return (Data(), 401) }
                 return quotaReply(for: request)
-            }
+            },
+            vaultAccess: { interaction in vaultAccesses.withLock { $0.append(interaction) } }
         )
         _ = try await service.saveAuthorization(identity: sample, credential: makeCredential("old"))
+        vaultAccesses.withLock { $0.removeAll() }
 
-        _ = try await service.refreshQuota(for: sample.id)
+        _ = try await service.refreshQuota(for: sample.id, interaction: .disallowed)
         #expect(renewals.withLock { $0 } == 1)
         #expect(quota.withLock { $0.first } == "Bearer access-old")
+        let accesses = vaultAccesses.withLock { $0 }
+        #expect(!accesses.isEmpty && accesses.allSatisfy { $0 == .disallowed })
         #expect(try fixture.credential(sample.id)?.token.accessToken == "renewed")
         #expect(try fixture.credential(sample.id)?.token.refreshToken == "refresh-old")
     }
@@ -79,12 +84,44 @@ struct AccountFlowTests {
         defer { fixture.cleanUp() }
         let online = fixture.service()
         _ = try await online.saveAuthorization(identity: sample, credential: makeCredential("one"))
-        let refreshed = try await online.refreshQuota(for: sample.id)
+        let refreshed = try await online.refreshQuota(for: sample.id, interaction: .allowed)
         let offline = fixture.service(send: { _ in (Data(), 503) })
         await #expect(throws: AGYError.serviceRejected(503)) {
-            try await offline.refreshQuota(for: sample.id)
+            try await offline.refreshQuota(for: sample.id, interaction: .allowed)
         }
         #expect(try await offline.list().first?.quota == refreshed.quota)
+    }
+
+    @Test func lockedKeychainDefersAutomaticQuotaRefreshAndAllowsManualRetry() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let initial = fixture.service()
+        _ = try await initial.saveAuthorization(identity: sample, credential: makeCredential("one"))
+        let cached = try await initial.refreshQuota(for: sample.id, interaction: .allowed)
+        let locked = fixture.service(vaultAccess: { interaction in
+            if interaction == .disallowed { throw AGYError.keychainInteractionRequired }
+        })
+
+        await #expect(throws: AGYError.keychainInteractionRequired) {
+            try await locked.refreshQuota(for: sample.id, interaction: .disallowed)
+        }
+        #expect(try await locked.list().first?.quota == cached.quota)
+        let refreshed = try await locked.refreshQuota(for: sample.id, interaction: .allowed)
+        #expect(refreshed.quota?.entries == cached.quota?.entries)
+    }
+
+    @Test func activeAccountIsUnknownWhenLegacyCredentialNeedsKeychainPermission() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let initial = fixture.service()
+        _ = try await initial.saveAuthorization(identity: sample, credential: makeCredential("one"))
+        try await initial.switchAccount(to: sample.id)
+        let locked = fixture.service(vaultAccess: { interaction in
+            #expect(interaction == .disallowed)
+            throw AGYError.keychainInteractionRequired
+        })
+
+        #expect(try await locked.activeAccount() == .unknown)
     }
 
     @Test func removingAnAccountDoesNotSignClientsOut() async throws {
@@ -98,6 +135,133 @@ struct AccountFlowTests {
         #expect(try await service.list().isEmpty)
         #expect(try fixture.credential(saved.id) == nil)
         #expect(try await service.activeAccount() == .unmanaged)
+    }
+
+    @Test func backupExportsAnEncryptedFileAndRestoresAccountsOnAnotherService() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let origin = fixture.service()
+        _ = try await origin.saveAuthorization(identity: sample, credential: makeCredential("alex"))
+        let other = GoogleIdentity(id: "other", email: "other@example.com", name: nil)
+        _ = try await origin.saveAuthorization(identity: other, credential: makeCredential("other"))
+
+        let url = fixture.root.appendingPathComponent("backup.\(AccountBackup.fileExtension)")
+        let count = try await origin.exportBackup(to: url, passphrase: "open sesame")
+        #expect(count == 2)
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        #expect(attributes[.posixPermissions] as? Int == 0o600)
+
+        let contents = try Data(contentsOf: url)
+        #expect(!String(decoding: contents, as: UTF8.self).contains("refresh-alex"))
+        let entries = try AccountBackup.read(contents, passphrase: "open sesame")
+        #expect(entries.map(\.identity) == [sample, other])
+
+        // Simulate a different machine with its own account directory and credential vault.
+        let restoredVault = Mutex<[String: Data]>([:])
+        let target = AccountService(
+            repository: .init(directory: fixture.root.appendingPathComponent("other-machine/accounts")),
+            vault: .init(
+                read: { id, _ in restoredVault.withLock { $0[id] } },
+                write: { data, id, _ in restoredVault.withLock { $0[id] = data } }
+            ),
+            clients: fixture.clients,
+            quota: QuotaClient(version: "2.34.0", send: quotaReply)
+        )
+        let summary = try await target.importBackup(contents, passphrase: "open sesame")
+        #expect(summary == BackupImportSummary(imported: 2, skipped: 0))
+        let originAccounts = try await origin.list()
+        #expect(try await target.list() == originAccounts)
+        #expect(try fixture.credential("alex")?.token.refreshToken == "refresh-alex")
+        #expect(try fixture.credential("other")?.token.refreshToken == "refresh-other")
+    }
+
+    @Test func importingTwiceSkipsExistingAccountsAndRejectsWrongPassphrase() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let entries = [BackupAccount(identity: sample, credential: makeCredential("backup"), quota: nil)]
+        let contents = try AccountBackup.write(entries, passphrase: "open sesame")
+
+        let target = fixture.service()
+        let first = try await target.importBackup(contents, passphrase: "open sesame")
+        #expect(first == BackupImportSummary(imported: 1, skipped: 0))
+        let second = try await target.importBackup(contents, passphrase: "open sesame")
+        #expect(second == BackupImportSummary(imported: 0, skipped: 1))
+        #expect(try fixture.credential("alex")?.token.refreshToken == "refresh-backup")
+
+        await #expect(throws: AGYError.invalidBackup) {
+            _ = try await target.importBackup(contents, passphrase: "wrong passphrase")
+        }
+    }
+
+    @Test func importRestoresLostCredentialsWithoutDuplicatingTheAccount() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let target = fixture.service()
+        _ = try await target.saveAuthorization(identity: sample, credential: makeCredential("temporary"))
+        fixture.vault.withLock { $0[sample.id] = nil }
+
+        let entries = [BackupAccount(identity: sample, credential: makeCredential("restored"), quota: nil)]
+        let contents = try AccountBackup.write(entries, passphrase: "open sesame")
+        let summary = try await target.importBackup(contents, passphrase: "open sesame")
+        #expect(summary == BackupImportSummary(imported: 1, skipped: 0))
+        #expect(try await target.list().map(\.id) == [sample.id])
+        #expect(try fixture.credential(sample.id)?.token.refreshToken == "refresh-restored")
+    }
+
+    @Test func emptyBackupsAreRejectedOnExportAndImport() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let service = fixture.service()
+        await #expect(throws: AGYError.emptyBackup) {
+            _ = try await service.exportBackup(
+                to: fixture.root.appendingPathComponent("empty.\(AccountBackup.fileExtension)"),
+                passphrase: "open sesame"
+            )
+        }
+        let contents = try AccountBackup.write([], passphrase: "open sesame")
+        await #expect(throws: AGYError.emptyBackup) {
+            _ = try await service.importBackup(contents, passphrase: "open sesame")
+        }
+    }
+}
+
+struct AccountBackupTests {
+    private let sample = GoogleIdentity(id: "alex", email: "alex@example.com", name: "Alex")
+    private let passphrase = "open sesame"
+
+    @Test func roundTripsAccountsAndNeverStoresPlaintextCredentials() throws {
+        let entries = [BackupAccount(identity: sample, credential: makeCredential("alex"), quota: nil)]
+        let file = try AccountBackup.write(entries, passphrase: passphrase)
+        #expect(!String(decoding: file, as: UTF8.self).contains("refresh-alex"))
+        #expect(try AccountBackup.read(file, passphrase: passphrase) == entries)
+    }
+
+    @Test func rejectsWrongPassphrasesUnrecognizedFilesAndTampering() throws {
+        let entries = [BackupAccount(identity: sample, credential: makeCredential("alex"), quota: nil)]
+        let file = try AccountBackup.write(entries, passphrase: passphrase)
+        #expect(throws: AGYError.invalidBackup) {
+            _ = try AccountBackup.read(file, passphrase: "wrong passphrase")
+        }
+        #expect(throws: AGYError.invalidBackup) {
+            _ = try AccountBackup.read(Data(#"{"format":"something.else"}"#.utf8), passphrase: passphrase)
+        }
+
+        var object = try #require(try JSONSerialization.jsonObject(with: file) as? [String: Any])
+        object["format"] = "something.else"
+        object["version"] = 99
+        object["iterations"] = 500_000_000
+        #expect(throws: AGYError.invalidBackup) {
+            _ = try AccountBackup.read(try JSONSerialization.data(withJSONObject: object), passphrase: passphrase)
+        }
+
+        object = try #require(try JSONSerialization.jsonObject(with: file) as? [String: Any])
+        let payload = try #require(Data(base64Encoded: object["payload"] as? String ?? ""))
+        var tampered = payload
+        tampered[payload.count - 1] ^= 0xFF
+        object["payload"] = tampered.base64EncodedString()
+        #expect(throws: AGYError.invalidBackup) {
+            _ = try AccountBackup.read(try JSONSerialization.data(withJSONObject: object), passphrase: passphrase)
+        }
     }
 }
 
@@ -287,7 +451,7 @@ struct ClientCredentialTests {
         let clients = ClientCredentials(targets: [
             system.target(keychain: true),
             newFallback.target(),
-            .init(keychainEncoding: false, read: { nil }, write: { _ in throw AGYError.keychain(-1) }),
+            .init(keychainEncoding: false, read: { _ in nil }, write: { _ in throw AGYError.keychain(-1) }),
         ])
         #expect(throws: AGYError.keychain(-1)) {
             try clients.install(makeCredential("new"))
@@ -304,6 +468,133 @@ struct ClientCredentialTests {
         let clients = ClientCredentials(targets: [desktop.target(), cli.target()])
         #expect(try clients.activeAccount(knownSubjects: [], matchToken: { _ in "one" }) == .inconsistent)
     }
+
+    @Test(arguments: [true, false])
+    func identifiesTheKnownClientWhenTheSharedKeychainIsLockedOrLacksASubject(locked: Bool) throws {
+        let encoder = JSONEncoder()
+        let shared = try encoder.encode(makeCredential("same"))
+        let cli = Cell()
+        cli.write(try encoder.encode(makeCredential("same", subject: "alex")))
+        let clients = ClientCredentials(targets: [
+            .init(keychainEncoding: true, read: { interaction in
+                #expect(interaction == .disallowed)
+                if locked { throw AGYError.keychainInteractionRequired }
+                return shared
+            }, write: { _ in }),
+            cli.target(),
+        ])
+
+        let account = try clients.activeAccount(knownSubjects: ["alex"]) { _ in
+            Issue.record("A known subject should be enough to identify the account.")
+            return nil
+        }
+        #expect(account == .managed("alex"))
+    }
+
+    @Test func differentClientSubjectsRemainInconsistentWhenAThirdCredentialLacksASubject() throws {
+        let encoder = JSONEncoder()
+        let shared = Cell()
+        let desktop = Cell()
+        let cli = Cell()
+        shared.write(try encoder.encode(makeCredential("same")))
+        desktop.write(try encoder.encode(makeCredential("same", subject: "alex")))
+        cli.write(try encoder.encode(makeCredential("same", subject: "other")))
+        let clients = ClientCredentials(targets: [shared.target(keychain: true), desktop.target(), cli.target()])
+
+        #expect(try clients.activeAccount(knownSubjects: ["alex", "other"], matchToken: { _ in "alex" }) == .inconsistent)
+    }
+
+    @Test func sharedKeychainCanPromptDuringSwitchButNotDuringStatusRead() throws {
+        let system = Cell()
+        let clients = ClientCredentials(targets: [
+            .init(keychainEncoding: true, read: { interaction in
+                guard interaction == .allowed else { throw AGYError.keychainInteractionRequired }
+                return system.read()
+            }, write: system.write),
+        ])
+
+        #expect(throws: AGYError.keychainInteractionRequired) {
+            try clients.activeAccount(knownSubjects: [], matchToken: { _ in nil })
+        }
+        try clients.install(makeCredential("new"))
+        #expect(try system.read().map(ClientCredentials.decode)?.token.refreshToken == "refresh-new")
+    }
+
+    @Test func installationReadsSharedKeychainAtMostOnceAndSkipsItForUnsupportedLocalCredentials() throws {
+        let system = Cell()
+        let desktop = Cell()
+        let reads = Mutex(0)
+        let clients = ClientCredentials(targets: [
+            .init(keychainEncoding: true, read: { _ in
+                reads.withLock { $0 += 1 }
+                return system.read()
+            }, write: system.write),
+            desktop.target(),
+        ])
+
+        try clients.install(makeCredential("first"))
+        #expect(reads.withLock { $0 } == 1)
+
+        desktop.write(Data(#"{"token":{"access_token":"a","refresh_token":"r","token_type":"Bearer","expiry":"2100-01-01T00:00:00Z"},"auth_method":"enterprise"}"#.utf8))
+        reads.withLock { $0 = 0 }
+        #expect(throws: AGYError.unsupportedCredential) {
+            try clients.install(makeCredential("second"))
+        }
+        #expect(reads.withLock { $0 } == 0)
+    }
+
+    @Test func encryptedVaultUsesSingleCachedMasterKeyAndMigratesLegacyItems() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let keyEntries = Mutex<[String: Data]>([:])
+        let keyReads = Mutex(0)
+        let keyWrites = Mutex(0)
+        let keyStore = EncryptedCredentialVault.KeyStore(
+            read: { account, _ in
+                keyReads.withLock { $0 += 1 }
+                return keyEntries.withLock { $0[account] }
+            },
+            write: { data, account, _ in
+                keyWrites.withLock { $0 += 1 }
+                keyEntries.withLock { $0[account] = data }
+            }
+        )
+
+        let legacyEntries = Mutex<[String: Data]>(["legacy-user": Data("secret-legacy-token".utf8)])
+        let legacyStore = EncryptedCredentialVault.KeyStore(
+            read: { account, _ in legacyEntries.withLock { $0[account] } },
+            write: { data, account, _ in legacyEntries.withLock { $0[account] = data } }
+        )
+
+        let vault = EncryptedCredentialVault(directory: root, keyStore: keyStore, legacyStore: legacyStore)
+        let migrated = try vault.read("legacy-user", interaction: .allowed)
+        #expect(migrated == Data("secret-legacy-token".utf8))
+        #expect(legacyEntries.withLock { $0["legacy-user"] } == nil)
+        #expect(keyEntries.withLock { $0.keys.sorted() } == ["master-key"])
+
+        try vault.write(Data("secret-second-token".utf8), account: "second-user", interaction: .allowed)
+        #expect(keyWrites.withLock { $0 } == 1)
+        #expect(keyReads.withLock { $0 } == 1)
+
+        let fileURL = root.appendingPathComponent("credentials.enc")
+        let encryptedBytes = try Data(contentsOf: fileURL)
+        #expect(!String(decoding: encryptedBytes, as: UTF8.self).contains("secret-second-token"))
+        let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+        #expect(attributes[.posixPermissions] as? Int == 0o600)
+
+        // Simulate app relaunch: reading two accounts should only read the master key once.
+        keyReads.withLock { $0 = 0 }
+        let reopened = EncryptedCredentialVault(directory: root, keyStore: keyStore, legacyStore: legacyStore)
+        #expect(try reopened.read("legacy-user", interaction: .disallowed) == Data("secret-legacy-token".utf8))
+        #expect(try reopened.read("second-user", interaction: .disallowed) == Data("secret-second-token".utf8))
+        #expect(keyReads.withLock { $0 } == 1)
+
+        try reopened.write(nil, account: "legacy-user", interaction: .allowed)
+        try reopened.write(nil, account: "second-user", interaction: .allowed)
+        #expect(!FileManager.default.fileExists(atPath: fileURL.path))
+    }
 }
 
 private final class Cell: Sendable {
@@ -313,7 +604,7 @@ private final class Cell: Sendable {
     func write(_ data: Data?) { value.withLock { $0 = data } }
 
     func target(keychain: Bool = false) -> ClientCredentials.Target {
-        .init(keychainEncoding: keychain, read: read, write: write)
+        .init(keychainEncoding: keychain, read: { _ in self.read() }, write: write)
     }
 }
 
@@ -333,15 +624,24 @@ private final class Fixture: Sendable {
     var clients: ClientCredentials {
         ClientCredentials(targets: [
             system.target(keychain: true),
-            .init(keychainEncoding: false, read: desktop.read, write: desktop.write),
-            .init(keychainEncoding: false, read: cli.read, write: cli.write),
+            .init(keychainEncoding: false, read: { _ in try self.desktop.read() }, write: desktop.write),
+            .init(keychainEncoding: false, read: { _ in try self.cli.read() }, write: cli.write),
         ])
     }
 
-    func service(oauth: GoogleOAuth = .init(), send: @escaping HTTPTransport = quotaReply) -> AccountService {
+    func service(
+        oauth: GoogleOAuth = .init(), send: @escaping HTTPTransport = quotaReply,
+        vaultAccess: @escaping @Sendable (KeychainInteraction) throws -> Void = { _ in }
+    ) -> AccountService {
         AccountService(repository: repository, vault: .init(
-            read: { id in self.vault.withLock { $0[id] } },
-            write: { data, id in self.vault.withLock { $0[id] = data } }
+            read: { id, interaction in
+                try vaultAccess(interaction)
+                return self.vault.withLock { $0[id] }
+            },
+            write: { data, id, interaction in
+                try vaultAccess(interaction)
+                self.vault.withLock { $0[id] = data }
+            }
         ), clients: clients, oauth: oauth, quota: QuotaClient(version: "2.34.0", send: send))
     }
 
@@ -354,10 +654,14 @@ private final class Fixture: Sendable {
     func cleanUp() { try? FileManager.default.removeItem(at: root) }
 }
 
-private func makeCredential(_ id: String) -> AntigravityCredential {
-    .init(token: .init(accessToken: "access-" + id, refreshToken: "refresh-" + id,
-                       tokenType: "Bearer", expiry: "2100-01-01T00:00:00.123456Z"),
-          authMethod: "consumer", idToken: nil)
+private func makeCredential(_ id: String, subject: String? = nil) -> AntigravityCredential {
+    let idToken = subject.map {
+        let claims = Data("{\"sub\":\"\($0)\"}".utf8).base64EncodedString()
+        return "header.\(claims).signature"
+    }
+    return .init(token: .init(accessToken: "access-" + id, refreshToken: "refresh-" + id,
+                              tokenType: "Bearer", expiry: "2100-01-01T00:00:00.123456Z"),
+                 authMethod: "consumer", idToken: idToken)
 }
 
 private func quotaReply(for request: URLRequest) -> (Data, Int) {

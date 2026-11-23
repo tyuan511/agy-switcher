@@ -7,37 +7,63 @@ struct AccountsWindow: View {
     @State private var removal: Account?
 
     var body: some View {
-        VStack(spacing: 0) {
-            if let message = model.message {
-                MessageBar(text: message, symbol: "exclamationmark.circle", dismiss: model.dismissMessage)
-            } else if let status = model.switchNotice ?? model.activeDescription, !model.accounts.isEmpty {
-                MessageBar(text: status, symbol: "info.circle")
-            }
-
+        Group {
             if !model.loaded {
-                if model.message == nil {
-                    ProgressView(language.text("正在读取账号…")).frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    Button(language.text("重试")) { model.refresh() }.frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
-            } else if model.accounts.isEmpty {
-                ContentUnavailableView {
-                    Label(language.text("还没有账号"), systemImage: "person.crop.circle")
-                } description: {
-                    Text(language.text("添加 Google 账号以查看 Antigravity 和 agy 的配额。"))
-                } actions: {
-                    Button(language.text("添加账号"), systemImage: "plus") { model.add() }
-                        .buttonStyle(.glass)
-                        .disabled(model.changing)
-                }
-            } else {
-                List {
-                    ForEach(model.accounts) { account in
-                        AccountQuota(model: model, account: account) { removal = account }
-                            .padding(.vertical, 10)
+                VStack(spacing: 12) {
+                    if let message = model.message {
+                        MessageBar(text: message, symbol: "exclamationmark.circle.fill", tone: .error, dismiss: model.dismissMessage)
+                            .padding(.horizontal, 22)
+                            .padding(.top, 16)
+                        Button(language.text("重试")) { model.refresh() }
+                            .buttonStyle(.glass)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        ProgressView(language.text("正在读取账号…"))
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
-                .listStyle(.inset)
+            } else if model.accounts.isEmpty {
+                VStack(spacing: 0) {
+                    if model.message != nil || model.keychainPermissionRequired {
+                        banner
+                            .padding(.horizontal, 22)
+                            .padding(.top, 16)
+                    }
+                    ContentUnavailableView {
+                        Label(language.text("还没有账号"), systemImage: "person.crop.circle")
+                    } description: {
+                        Text(language.text("添加 Google 账号以查看 Antigravity 和 agy 的配额。"))
+                    } actions: {
+                        Button(language.text("添加账号"), systemImage: "plus") { model.add() }
+                            .buttonStyle(.glass)
+                            .disabled(model.changing)
+                    }
+                }
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        banner
+                        ForEach(model.accounts) { account in
+                            let isCurrent = model.active == .managed(account.id)
+                            AccountQuota(model: model, account: account) { removal = account }
+                                .padding(16)
+                                .background(
+                                    isCurrent ? AnyShapeStyle(Color.accentColor.opacity(0.055)) : AnyShapeStyle(.background),
+                                    in: RoundedRectangle(cornerRadius: 14)
+                                )
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 14)
+                                        .strokeBorder(
+                                            isCurrent ? AnyShapeStyle(Color.accentColor.opacity(0.28)) : AnyShapeStyle(.quaternary)
+                                        )
+                                        .allowsHitTesting(false)
+                                }
+                        }
+                    }
+                    .padding(22)
+                    .frame(maxWidth: 1_050)
+                    .frame(maxWidth: .infinity)
+                }
             }
         }
         .toolbar {
@@ -62,6 +88,23 @@ struct AccountsWindow: View {
             Button(language.text("移除账号"), role: .destructive) { model.remove(account) }
         } message: { account in
             Text(language.text("从 AGY Switcher 移除 \(account.identity.email) 及其本地配额记录。客户端登录状态由 Antigravity 和 agy 管理。"))
+        }
+    }
+
+    @ViewBuilder
+    private var banner: some View {
+        if let message = model.message {
+            MessageBar(text: message, symbol: "exclamationmark.circle.fill", tone: .error, dismiss: model.dismissMessage)
+        } else if model.keychainPermissionRequired {
+            MessageBar(
+                text: language.text("需要钥匙串权限以自动刷新配额。请在弹窗中选择「始终允许」。"),
+                symbol: "key.fill",
+                tone: .warning,
+                actionTitle: language.text("授权"),
+                action: { model.refresh() }
+            )
+        } else if let status = model.switchNotice ?? model.activeDescription, !model.accounts.isEmpty {
+            MessageBar(text: status, symbol: "info.circle.fill", tone: .info)
         }
     }
 }

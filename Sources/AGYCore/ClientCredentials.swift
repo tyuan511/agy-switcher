@@ -3,7 +3,7 @@ import Foundation
 struct ClientCredentials: Sendable {
     struct Target: Sendable {
         let keychainEncoding: Bool
-        let read: @Sendable () throws -> Data?
+        let read: @Sendable (KeychainInteraction) throws -> Data?
         let write: @Sendable (Data?) throws -> Void
     }
 
@@ -16,10 +16,10 @@ struct ClientCredentials: Sendable {
         let cli = SecretFile(url: gemini.appendingPathComponent("antigravity-cli/antigravity-oauth-token"))
         let keychain = KeychainCredentialStore(service: "gemini")
         targets = [
-            Target(keychainEncoding: true, read: { try keychain.read("antigravity") },
-                   write: { try keychain.write($0, account: "antigravity") }),
-            Target(keychainEncoding: false, read: desktop.read, write: desktop.write),
-            Target(keychainEncoding: false, read: cli.read, write: cli.write),
+            Target(keychainEncoding: true, read: { try keychain.read("antigravity", interaction: $0) },
+                   write: { try keychain.write($0, account: "antigravity", interaction: .allowed) }),
+            Target(keychainEncoding: false, read: { _ in try desktop.read() }, write: desktop.write),
+            Target(keychainEncoding: false, read: { _ in try cli.read() }, write: cli.write),
         ]
     }
 
@@ -28,15 +28,34 @@ struct ClientCredentials: Sendable {
     }
 
     func activeAccount(knownSubjects: Set<String>, matchToken: (String) throws -> String?) throws -> ActiveAccount {
-        let present = try targets.compactMap { try $0.read() }
-        guard !present.isEmpty else { return .signedOut }
-        let credentials = present.compactMap { try? Self.decode($0) }
-        guard let first = credentials.first else {
-            return present.dropFirst().allSatisfy { $0 == present[0] } ? .unmanaged : .inconsistent
+        var readable: [Data] = []
+        var needsPermission = false
+        for target in targets {
+            do {
+                if let data = try target.read(.disallowed) { readable.append(data) }
+            } catch AGYError.keychainInteractionRequired {
+                needsPermission = true
+            }
         }
-        guard credentials.count == present.count,
+        let account = try Self.identifyAccount(in: readable, knownSubjects: knownSubjects, matchToken: matchToken)
+        if needsPermission && (account == .signedOut || account == .unmanaged) {
+            throw AGYError.keychainInteractionRequired
+        }
+        return account
+    }
+
+    private static func identifyAccount(
+        in readable: [Data], knownSubjects: Set<String>, matchToken: (String) throws -> String?
+    ) throws -> ActiveAccount {
+        guard let firstData = readable.first else { return .signedOut }
+        let credentials = readable.compactMap { try? Self.decode($0) }
+        guard let first = credentials.first else {
+            return readable.dropFirst().allSatisfy { $0 == firstData } ? .unmanaged : .inconsistent
+        }
+        let subjects = Set(credentials.compactMap(\.subject))
+        guard subjects.count <= 1, credentials.count == readable.count,
               credentials.dropFirst().allSatisfy({ $0.matches(first) }) else { return .inconsistent }
-        if let subject = first.subject, knownSubjects.contains(subject) { return .managed(subject) }
+        if let subject = subjects.first, knownSubjects.contains(subject) { return .managed(subject) }
         if let id = try matchToken(first.token.refreshToken) { return .managed(id) }
         return .unmanaged
     }
@@ -46,28 +65,36 @@ struct ClientCredentials: Sendable {
         let updates = targets.map { target in
             target.keychainEncoding ? Self.keychainPrefix + json.base64EncodedData() : json
         }
-        let previous = try targets.map { try $0.read() }
-        for data in previous.compactMap({ $0 }) {
-            guard let current = try? Self.decode(data), current.authMethod == "consumer" else {
-                throw AGYError.unsupportedCredential
+        // Validate local files before touching the keychain so unsupported credentials fail without prompting.
+        var previous = [Data?](repeating: nil, count: targets.count)
+        let readOrder = targets.indices.sorted { !targets[$0].keychainEncoding && targets[$1].keychainEncoding }
+        for index in readOrder {
+            let data = try targets[index].read(.allowed)
+            if let data {
+                guard let current = try? Self.decode(data), current.authMethod == "consumer" else {
+                    throw AGYError.unsupportedCredential
+                }
             }
+            previous[index] = data
         }
 
         var attempted: [Int] = []
         do {
             for index in targets.indices {
-                guard try targets[index].read() == previous[index] else { throw AGYError.credentialChanged }
+                if !targets[index].keychainEncoding {
+                    guard try targets[index].read(.allowed) == previous[index] else { throw AGYError.credentialChanged }
+                }
                 attempted.append(index)
                 try targets[index].write(updates[index])
             }
-            for index in targets.indices {
-                guard try targets[index].read() == updates[index] else { throw AGYError.switchVerification }
+            for index in targets.indices where !targets[index].keychainEncoding {
+                guard try targets[index].read(.allowed) == updates[index] else { throw AGYError.switchVerification }
             }
         } catch {
             var recoveryFailed = false
             for index in attempted.reversed() {
                 do {
-                    let value = try targets[index].read()
+                    let value = try targets[index].read(.allowed)
                     if value == previous[index] { continue }
                     guard value == updates[index] else {
                         // Another client wrote here during the switch. Keep its newer value.
@@ -75,7 +102,7 @@ struct ClientCredentials: Sendable {
                         continue
                     }
                     try targets[index].write(previous[index])
-                    if try targets[index].read() != previous[index] { recoveryFailed = true }
+                    if try targets[index].read(.allowed) != previous[index] { recoveryFailed = true }
                 } catch {
                     recoveryFailed = true
                 }

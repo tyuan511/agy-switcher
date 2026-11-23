@@ -2,16 +2,47 @@ import Foundation
 import SQLite3
 
 struct AGYUsageDatabase: Sendable {
-    let directory: URL
+    static let cliDirectory = URL.homeDirectory.appending(path: ".gemini/antigravity-cli", directoryHint: .isDirectory)
+    static let antigravityDirectory = URL.homeDirectory.appending(path: ".gemini/antigravity", directoryHint: .isDirectory)
 
-    func report(observations: [AGYUsageObservation], dayCount: Int) throws -> AGYUsageReport {
-        let files: [URL]
-        do {
-            files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.contentModificationDateKey],
-                                                                options: [.skipsHiddenFiles])
-        } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
-            return AGYUsageReport(events: [], dayCount: dayCount)
+    let directories: [URL]
+
+    init(directory: URL) {
+        self.directories = [directory]
+    }
+
+    init(directories: [URL]) {
+        self.directories = directories
+    }
+
+    static func localReport(dayCount: Int) async throws -> AGYUsageReport {
+        let task = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            let directories = [
+                cliDirectory.appending(path: "conversations", directoryHint: .isDirectory),
+                antigravityDirectory.appending(path: "conversations", directoryHint: .isDirectory),
+            ]
+            return try AGYUsageDatabase(directories: directories).report(dayCount: dayCount)
         }
+        return try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+    }
+
+    func report(dayCount: Int) throws -> AGYUsageReport {
+        var databaseFiles: [URL] = []
+        for directory in directories {
+            let files: [URL]
+            do {
+                files = try FileManager.default.contentsOfDirectory(
+                    at: directory,
+                    includingPropertiesForKeys: [.contentModificationDateKey],
+                    options: [.skipsHiddenFiles]
+                )
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
+                continue
+            }
+            databaseFiles.append(contentsOf: files.filter { $0.pathExtension == "db" })
+        }
+        guard !databaseFiles.isEmpty else { return AGYUsageReport(events: [], dayCount: dayCount) }
 
         let now = Date.now
         let calendar = Calendar.current
@@ -19,13 +50,7 @@ struct AGYUsageDatabase: Sendable {
         var events: [AGYUsageEvent] = []
         var skipped = 0
         var seenIdentifiers: Set<String> = []
-        let linkedIDs = Set(observations.map(\.conversationID))
-        let databases = files.filter { $0.pathExtension == "db" }.sorted { first, second in
-            let firstLinked = linkedIDs.contains(first.deletingPathExtension().lastPathComponent.lowercased())
-            let secondLinked = linkedIDs.contains(second.deletingPathExtension().lastPathComponent.lowercased())
-            if firstLinked != secondLinked { return firstLinked }
-            return first.lastPathComponent < second.lastPathComponent
-        }
+        let databases = databaseFiles.sorted { $0.lastPathComponent < $1.lastPathComponent }
         for file in databases {
             try Task.checkCancellation()
             let modified = try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
@@ -43,7 +68,7 @@ struct AGYUsageDatabase: Sendable {
                 skipped += 1
             }
         }
-        return AGYUsageReport(events: events, observations: observations, skippedDatabases: skipped,
+        return AGYUsageReport(events: events, skippedDatabases: skipped,
                               dayCount: dayCount, now: now, calendar: calendar)
     }
 

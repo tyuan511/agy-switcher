@@ -23,24 +23,56 @@ struct SwitchButton: View {
 }
 
 struct MessageBar: View {
+    enum Tone {
+        case info, warning, error
+
+        var tint: Color {
+            switch self {
+            case .info: .accentColor
+            case .warning: .orange
+            case .error: .red
+            }
+        }
+    }
+
     let text: String
     let symbol: String
-    var dismiss: (() -> Void)?
+    var tone: Tone = .info
+    var actionTitle: String? = nil
+    var action: (() -> Void)? = nil
+    var dismiss: (() -> Void)? = nil
     @Environment(\.appLanguage) private var language
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Label(text, systemImage: symbol).frame(maxWidth: .infinity, alignment: .leading)
+        HStack(alignment: .center, spacing: 8) {
+            Image(systemName: symbol)
+                .foregroundStyle(tone.tint)
+                .accessibilityHidden(true)
+            Text(text)
+                .foregroundStyle(.primary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+            if let actionTitle, let action {
+                Button(actionTitle, action: action)
+                    .buttonStyle(.glass)
+                    .controlSize(.mini)
+            }
             if let dismiss {
                 Button(language.text("关闭提示"), systemImage: "xmark", action: dismiss)
                     .labelStyle(.iconOnly)
                     .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
             }
         }
         .font(.caption)
-        .foregroundStyle(.secondary)
         .padding(.vertical, 8)
         .padding(.horizontal, 12)
+        .background(tone.tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(tone.tint.opacity(0.22))
+                .allowsHitTesting(false)
+        }
     }
 }
 
@@ -54,7 +86,7 @@ struct AccountQuota: View {
     private var current: Bool { model.active == .managed(account.id) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 11) {
             HStack(spacing: 8) {
                 Text(account.identity.email)
                     .font(.headline)
@@ -102,11 +134,30 @@ struct AccountQuota: View {
             }
 
             if let error = model.quotaErrors[account.id] {
-                let title = language.text(model.needsAuthorization.contains(account.id) ? "需要重新授权" : "配额刷新失败")
-                Label(title, systemImage: "exclamationmark.circle")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .help(language.errorDescription(error))
+                let needsAuth = model.needsAuthorization.contains(account.id)
+                let title = language.text(needsAuth ? "需要重新授权" : "配额刷新失败")
+                let tint: Color = needsAuth ? .orange : .red
+                HStack(spacing: 8) {
+                    Image(systemName: needsAuth ? "exclamationmark.triangle.fill" : "exclamationmark.circle.fill")
+                        .foregroundStyle(tint)
+                        .accessibilityHidden(true)
+                    Text(title)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 4)
+                    if needsAuth {
+                        Button(language.text("重新授权")) { model.add(account) }
+                            .buttonStyle(.glass)
+                            .controlSize(.mini)
+                            .disabled(model.changing || refreshing)
+                    } else {
+                        Button(language.text("重试")) { model.refresh(account.id) }
+                            .buttonStyle(.glass)
+                            .controlSize(.mini)
+                            .disabled(refreshing)
+                    }
+                }
+                .font(.caption)
+                .help(language.errorDescription(error))
             }
         }
     }
@@ -193,6 +244,14 @@ private struct QuotaUsageRow: View {
         entry.fraction.formatted(.percent.precision(.fractionLength(0)).locale(language.locale))
     }
 
+    private var quotaTint: Color {
+        switch entry.fraction {
+        case ...0.1: .red
+        case ...0.3: .orange
+        default: .green
+        }
+    }
+
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
@@ -205,12 +264,12 @@ private struct QuotaUsageRow: View {
             }
             Spacer(minLength: 6)
             Text(language.text("剩余 \(percent)"))
-                .font(.subheadline)
+                .font(.subheadline.weight(entry.fraction <= 0.3 ? .medium : .regular))
                 .monospacedDigit()
-                .foregroundStyle(.secondary)
+                .foregroundStyle(entry.fraction <= 0.3 ? quotaTint : .secondary)
                 .fixedSize()
             Gauge(value: entry.fraction) { Text(language.text("剩余配额")) }
-                .gaugeStyle(QuotaRingStyle())
+                .gaugeStyle(QuotaRingStyle(tint: quotaTint))
                 .alignmentGuide(.firstTextBaseline) { $0[VerticalAlignment.center] + 4 }
                 .accessibilityHidden(true)
         }
@@ -237,13 +296,16 @@ private struct QuotaUsageRow: View {
 }
 
 private struct QuotaRingStyle: GaugeStyle {
+    var tint: Color = .green
+
     func makeBody(configuration: Configuration) -> some View {
         ZStack {
             Circle().strokeBorder(.quaternary, lineWidth: 2)
             Circle().inset(by: 1)
                 .trim(from: 0, to: configuration.value)
-                .stroke(.green, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                .stroke(tint, style: StrokeStyle(lineWidth: 2, lineCap: .round))
                 .rotationEffect(.degrees(-90))
+                .animation(.easeInOut(duration: 0.25), value: configuration.value)
         }
         .frame(width: 15, height: 15)
     }

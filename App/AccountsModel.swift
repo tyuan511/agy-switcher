@@ -20,9 +20,11 @@ final class AccountsModel {
     private(set) var authorizing = false
     private(set) var switching: String?
     private(set) var removing = false
+    private(set) var transferring = false
     private(set) var refreshing: Set<String> = []
     private(set) var quotaErrors: [String: any Error] = [:]
     private(set) var needsAuthorization: Set<String> = []
+    private(set) var keychainPermissionRequired = false
 
     private let service: AccountService
     private var switchOutcome: SwitchOutcome?
@@ -32,23 +34,26 @@ final class AccountsModel {
     private var lastActiveRead: Date?
     private var activeReadVersion = 0
     private var lastQuotaAttempts: [String: Date] = [:]
-    private var refreshQueue: [String] = []
+    private var refreshQueue: [(id: String, interaction: KeychainInteraction)] = []
     private var runningRefreshes = 0
     private var authorizationTask: Task<Void, Never>?
+
+    /// 演示模式下不读写真实凭据，界面完全由虚构数据驱动。
+    private let isDemo = AppLaunch.isDemoAccounts
 
     init() {
         let folder = URL.applicationSupportDirectory.appendingPathComponent("AGY Switcher", isDirectory: true)
         let antigravity = Bundle(url: URL(filePath: "/Applications/Antigravity.app", directoryHint: .isDirectory))
         let version = antigravity?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.34.0"
         service = AccountService(repository: .init(directory: folder), quota: .init(version: version))
+        if isDemo {
+            accounts = AGYAccountsDemo.accounts
+            loaded = true
+            active = accounts.first.map { .managed($0.id) } ?? .unknown
+        }
     }
 
-    var changing: Bool { authorizing || switching != nil || removing }
-
-    var currentAccount: Account? {
-        guard case .managed(let id) = active else { return nil }
-        return accounts.first { $0.id == id }
-    }
+    var changing: Bool { authorizing || switching != nil || removing || transferring }
 
     var activeDescription: String? {
         let language = preferences.language
@@ -87,7 +92,7 @@ final class AccountsModel {
     func dismissMessage() { failure = nil }
 
     func surfaceOpened() async {
-        guard !opening, !changing else { return }
+        guard !isDemo, !opening, !changing else { return }
         opening = true
         defer { opening = false }
         if !loaded {
@@ -110,22 +115,23 @@ final class AccountsModel {
             let last = lastQuotaAttempts[account.id] ?? account.quota?.updatedAt
             return !needsAuthorization.contains(account.id) && interval.hasElapsed(since: last, at: now)
         }
-        enqueueRefresh(stale.map(\.id))
+        enqueueRefresh(stale.map(\.id), interaction: .disallowed)
     }
 
     func refresh(_ id: String? = nil) {
+        guard !isDemo else { return }
         Task {
             if !loaded {
                 await surfaceOpened()
                 return
             }
-            enqueueRefresh(id.map { [$0] } ?? accounts.map(\.id))
+            enqueueRefresh(id.map { [$0] } ?? accounts.map(\.id), interaction: .allowed)
             if !changing { await readActiveAccount() }
         }
     }
 
     func add(_ account: Account? = nil) {
-        guard loaded, !changing else { return }
+        guard !isDemo, loaded, !changing else { return }
         if let account, refreshing.contains(account.id) { return }
         dismissMessage()
         authorizing = true
@@ -140,8 +146,9 @@ final class AccountsModel {
                 }
                 upsert(added)
                 needsAuthorization.remove(added.id)
+                keychainPermissionRequired = false
                 await readActiveAccount()
-                enqueueRefresh([added.id])
+                enqueueRefresh([added.id], interaction: .disallowed)
             } catch is CancellationError {
                 // Cancellation is exposed by the authorization sheet.
             } catch {
@@ -155,7 +162,7 @@ final class AccountsModel {
     func cancelAuthorization() { authorizationTask?.cancel() }
 
     func switchTo(_ account: Account) {
-        guard !changing else { return }
+        guard !isDemo, !changing else { return }
         switching = account.id
         activeReadVersion += 1
         dismissMessage()
@@ -164,6 +171,7 @@ final class AccountsModel {
             defer { switching = nil }
             do {
                 try await service.switchAccount(to: account.id)
+                keychainPermissionRequired = false
             } catch {
                 if error as? AGYError == .authenticationRequired { needsAuthorization.insert(account.id) }
                 await readActiveAccount(reportError: false)
@@ -184,7 +192,7 @@ final class AccountsModel {
     }
 
     func remove(_ account: Account) {
-        guard !changing, !refreshing.contains(account.id) else { return }
+        guard !isDemo, !changing, !refreshing.contains(account.id) else { return }
         removing = true
         Task {
             defer { removing = false }
@@ -199,6 +207,25 @@ final class AccountsModel {
                 failure = (.removeAccount, error)
             }
         }
+    }
+
+    func exportBackup(to url: URL, passphrase: String) async throws -> Int {
+        guard !isDemo, !changing else { return 0 }
+        transferring = true
+        defer { transferring = false }
+        return try await service.exportBackup(to: url, passphrase: passphrase)
+    }
+
+    func importBackup(from url: URL, passphrase: String) async throws -> BackupImportSummary {
+        guard !isDemo, !changing else { return BackupImportSummary(imported: 0, skipped: 0) }
+        transferring = true
+        defer { transferring = false }
+        let data = try Data(contentsOf: url)
+        let summary = try await service.importBackup(data, passphrase: passphrase)
+        accounts = try await service.list()
+        loaded = true
+        await readActiveAccount()
+        return summary
     }
 
     private func setSwitchOutcome(_ outcome: SwitchOutcome?) {
@@ -231,16 +258,16 @@ final class AccountsModel {
         }
     }
 
-    private func enqueueRefresh(_ ids: [String]) {
+    private func enqueueRefresh(_ ids: [String], interaction: KeychainInteraction) {
         for id in ids where refreshing.insert(id).inserted {
-            refreshQueue.append(id)
+            refreshQueue.append((id, interaction))
         }
         startReadyRefreshes()
     }
 
     private func startReadyRefreshes() {
         while runningRefreshes < 3, !refreshQueue.isEmpty {
-            let id = refreshQueue.removeFirst()
+            let (id, interaction) = refreshQueue.removeFirst()
             runningRefreshes += 1
             lastQuotaAttempts[id] = .now
             Task {
@@ -250,9 +277,13 @@ final class AccountsModel {
                     startReadyRefreshes()
                 }
                 do {
-                    upsert(try await service.refreshQuota(for: id))
+                    upsert(try await service.refreshQuota(for: id, interaction: interaction))
                     needsAuthorization.remove(id)
                     quotaErrors[id] = nil
+                    keychainPermissionRequired = false
+                } catch AGYError.keychainInteractionRequired where interaction == .disallowed {
+                    // Keep cached quota and surface a non-intrusive prompt to authorize once.
+                    keychainPermissionRequired = true
                 } catch {
                     if error as? AGYError == .authenticationRequired { needsAuthorization.insert(id) }
                     quotaErrors[id] = error

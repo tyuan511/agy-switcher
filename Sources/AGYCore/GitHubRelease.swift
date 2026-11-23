@@ -22,8 +22,6 @@ struct ReleaseVersion: Comparable, Sendable, CustomStringConvertible {
 }
 
 enum UpdateError: Error, Equatable {
-    case repositoryAccess
-    case invalidToken
     case http(Int)
     case invalidRelease
     case invalidDownload
@@ -34,8 +32,6 @@ enum UpdateError: Error, Equatable {
 
     var message: String.LocalizationValue {
         switch self {
-        case .repositoryAccess: "私有仓库需要有读取权限的 GitHub 令牌。"
-        case .invalidToken: "请输入有效的 GitHub 读取令牌。"
         case .http(let status): "GitHub 请求失败（HTTP \(String(status))）。"
         case .invalidRelease: "GitHub Release 缺少有效的 macOS 更新包。"
         case .invalidDownload: "下载的更新包不完整或校验失败。"
@@ -49,6 +45,18 @@ enum UpdateError: Error, Equatable {
 
 struct GitHubRelease: Sendable {
     static let repository = "tyuan511/agy-switcher"
+
+    enum Architecture: String, Sendable {
+        case arm64, amd64
+
+        static var current: Self {
+            #if arch(arm64)
+            .arm64
+            #else
+            .amd64
+            #endif
+        }
+    }
 
     let version: ReleaseVersion
     let tag: String
@@ -69,7 +77,8 @@ struct GitHubRelease: Sendable {
         let assets: [Asset]
     }
 
-    static func update(from data: Data, currentVersion: ReleaseVersion) throws -> Self? {
+    static func update(from data: Data, currentVersion: ReleaseVersion,
+                       architecture: Architecture = .current) throws -> Self? {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         guard let release = try? decoder.decode(Response.self, from: data) else {
@@ -78,9 +87,11 @@ struct GitHubRelease: Sendable {
         let tag = release.tagName
         guard !release.draft, !release.prerelease, tag.hasPrefix("v"),
               let version = ReleaseVersion(String(tag.dropFirst())), version > currentVersion else { return nil }
-        let name = "AGY-Switcher-\(tag)-macOS-universal.dmg"
-        guard let asset = release.assets.first(where: { $0.name == name && $0.state == "uploaded" }),
-              asset.id > 0, asset.size > 0 else { throw UpdateError.invalidRelease }
+        let prefix = "AGY-Switcher-\(tag)-macOS-"
+        let uploaded = release.assets.filter { $0.state == "uploaded" && $0.id > 0 && $0.size > 0 }
+        let matching = uploaded.first { $0.name == "\(prefix)\(architecture.rawValue).dmg" }
+        let universal = uploaded.first { $0.name == "\(prefix)universal.dmg" }
+        guard let asset = matching ?? universal else { throw UpdateError.invalidRelease }
         return Self(version: version, tag: tag, asset: asset)
     }
 
@@ -118,14 +129,14 @@ struct GitHubReleaseClient: Sendable {
         self.session = session ?? URLSession(configuration: configuration)
     }
 
-    func latestUpdate(after version: ReleaseVersion, token: String?) async throws -> GitHubRelease? {
+    func latestUpdate(after version: ReleaseVersion) async throws -> GitHubRelease? {
         let (data, response) = try await session.data(
-            for: request(path: "/releases/latest", token: token), delegate: GitHubReleaseRedirects()
+            for: request(path: "/releases/latest"), delegate: GitHubReleaseRedirects()
         )
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if status == 404 {
             let (_, repository) = try await session.data(
-                for: request(path: "", token: token), delegate: GitHubReleaseRedirects()
+                for: request(path: ""), delegate: GitHubReleaseRedirects()
             )
             try validate(repository)
             return nil
@@ -134,9 +145,8 @@ struct GitHubReleaseClient: Sendable {
         return try GitHubRelease.update(from: data, currentVersion: version)
     }
 
-    func download(_ update: GitHubRelease, token: String?) async throws -> URL {
-        var request = request(path: "/releases/assets/\(update.asset.id)", token: token)
-        request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
+    func download(_ update: GitHubRelease) async throws -> URL {
+        let request = request(path: "/releases/assets/\(update.asset.id)", accept: "application/octet-stream")
         let (file, response) = try await session.download(for: request, delegate: GitHubReleaseRedirects())
         do {
             try validate(response)
@@ -148,22 +158,15 @@ struct GitHubReleaseClient: Sendable {
         }
     }
 
-    private func request(path: String, token: String?) -> URLRequest {
+    private func request(path: String, accept: String = "application/vnd.github+json") -> URLRequest {
         var request = URLRequest(url: URL(string: "https://api.github.com/repos/\(GitHubRelease.repository)\(path)")!)
-        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        if let token {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
+        request.setValue(accept, forHTTPHeaderField: "Accept")
         return request
     }
 
     private func validate(_ response: URLResponse) throws {
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        switch status {
-        case 200: return
-        case 401, 404: throw UpdateError.repositoryAccess
-        default: throw UpdateError.http(status)
-        }
+        guard status == 200 else { throw UpdateError.http(status) }
     }
 }
 
@@ -171,11 +174,10 @@ final class GitHubReleaseRedirects: NSObject, URLSessionTaskDelegate {
     static func validated(_ request: URLRequest) -> URLRequest? {
         guard let url = request.url, url.scheme == "https", let host = url.host,
               url.port == nil || url.port == 443 else { return nil }
-        if host == "api.github.com" { return request }
-        guard host == "github.com" || host.hasSuffix(".githubusercontent.com") else { return nil }
-        var redirect = request
-        redirect.setValue(nil, forHTTPHeaderField: "Authorization")
-        return redirect
+        guard host == "api.github.com" || host == "github.com" || host.hasSuffix(".githubusercontent.com") else {
+            return nil
+        }
+        return request
     }
 
     func urlSession(

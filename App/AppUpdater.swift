@@ -20,15 +20,11 @@ final class AppUpdater {
     private(set) var update: GitHubRelease?
     private(set) var checked = false
     private(set) var error: (any Error)?
-    private(set) var hasToken = false
 
     @ObservationIgnored private let client = GitHubReleaseClient()
-    @ObservationIgnored private let credentials = KeychainCredentialStore(service: "dev.fastvibe.agy-switch.updates")
-    private static let tokenAccount = "github-release-token"
 
     func start() {
         guard enabled else { return }
-        hasToken = (try? credentials.read(Self.tokenAccount)) != nil
         if CommandLine.arguments.contains(UpdateInstaller.failureArgument) {
             error = UpdateError.installationFailed
         }
@@ -50,28 +46,10 @@ final class AppUpdater {
         if interactive { error = nil }
         defer { activity = nil }
         do {
-            update = try await client.latestUpdate(after: currentVersion, token: storedToken())
+            update = try await client.latestUpdate(after: currentVersion)
             checked = true
         } catch {
             if interactive { self.error = error }
-        }
-    }
-
-    func saveToken(_ input: String) async {
-        guard activity == nil else { return }
-        let token = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard token.range(of: #"^[A-Za-z0-9_]*$"#, options: .regularExpression) != nil else {
-            error = UpdateError.invalidToken
-            return
-        }
-        do {
-            try credentials.write(token.isEmpty ? nil : Data(token.utf8), account: Self.tokenAccount)
-            hasToken = !token.isEmpty
-            update = nil
-            checked = false
-            await check()
-        } catch {
-            self.error = error
         }
     }
 
@@ -82,10 +60,9 @@ final class AppUpdater {
         defer { activity = nil }
         do {
             let installed = Bundle.main.bundleURL.resolvingSymlinksInPath()
-            let token = try storedToken()
             let client = client
             let staged = try await Task.detached {
-                let download = try await client.download(update, token: token)
+                let download = try await client.download(update)
                 defer { try? FileManager.default.removeItem(at: download) }
                 return try UpdateInstaller.stage(download, version: update.version, replacing: installed)
             }.value
@@ -99,9 +76,5 @@ final class AppUpdater {
         } catch {
             self.error = error
         }
-    }
-
-    private func storedToken() throws -> String? {
-        try credentials.read(Self.tokenAccount).flatMap { String(data: $0, encoding: .utf8) }
     }
 }
