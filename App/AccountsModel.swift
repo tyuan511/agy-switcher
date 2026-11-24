@@ -169,9 +169,14 @@ final class AccountsModel {
         setSwitchOutcome(nil)
         Task {
             defer { switching = nil }
+            let credential: AntigravityCredential
+            let stopped: AntigravityApplication.StoppedInstance?
             do {
-                try await service.switchAccount(to: account.id)
+                credential = try await service.prepareSwitch(to: account.id)
                 keychainPermissionRequired = false
+                // Quit Antigravity and its language_server before writing files so active watchers
+                // or shutdown flushes cannot overwrite the newly installed credentials.
+                stopped = try await AntigravityApplication.stopIfRunning()
             } catch {
                 if error as? AGYError == .authenticationRequired { needsAuthorization.insert(account.id) }
                 await readActiveAccount(reportError: false)
@@ -180,11 +185,25 @@ final class AccountsModel {
             }
 
             do {
-                let restarted = try await AntigravityApplication.restartIfRunning()
-                setSwitchOutcome(restarted ? .antigravityRestarted : .credentialsUpdated)
+                try await service.completeSwitch(to: account.id, credential: credential)
             } catch {
+                if let stopped { try? await AntigravityApplication.relaunch(stopped) }
+                if error as? AGYError == .authenticationRequired { needsAuthorization.insert(account.id) }
+                await readActiveAccount(reportError: false)
+                failure = (.switchAccount, error)
+                return
+            }
+
+            if let stopped {
+                do {
+                    try await AntigravityApplication.relaunch(stopped)
+                    setSwitchOutcome(.antigravityRestarted)
+                } catch {
+                    setSwitchOutcome(.credentialsUpdated)
+                    failure = (.restartAntigravity, error)
+                }
+            } else {
                 setSwitchOutcome(.credentialsUpdated)
-                failure = (.restartAntigravity, error)
             }
             active = .managed(account.id)
             lastActiveRead = .now

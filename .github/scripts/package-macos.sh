@@ -50,7 +50,27 @@ stage="$work_dir/stage"
 mkdir "$stage"
 signed_app="$stage/AGY Switcher.app"
 ditto "$app" "$signed_app"
-codesign --force --sign "$identity" --keychain "$keychain" --timestamp --options runtime "$signed_app"
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/../.." && pwd)"
+entitlements="$repo_root/Config/AGYSwitcher.entitlements"
+codesign_args=(--force --sign "$identity" --keychain "$keychain" --timestamp --options runtime)
+if [[ -n "${APPLE_PROVISIONING_PROFILE:-}" ]]; then
+  profile="$signed_app/Contents/embedded.provisionprofile"
+  printf '%s' "$APPLE_PROVISIONING_PROFILE" | base64 --decode > "$profile"
+  unset APPLE_PROVISIONING_PROFILE
+  profile_plist="$work_dir/profile.plist"
+  security cms -D -i "$profile" > "$profile_plist"
+  if [[ "$(plutil -extract Entitlements.com\.apple\.application-identifier raw "$profile_plist" 2>/dev/null || true)" != "J24Y9W38D8.dev.fastvibe.agy-switch" ]]; then
+    echo "::error::APPLE_PROVISIONING_PROFILE does not match J24Y9W38D8.dev.fastvibe.agy-switch." >&2
+    exit 1
+  fi
+  codesign_args+=(--entitlements "$entitlements")
+else
+  echo "::warning::APPLE_PROVISIONING_PROFILE is not set; building without Data Protection Keychain entitlements." >&2
+fi
+
+codesign "${codesign_args[@]}" "$signed_app"
 codesign --verify --deep --strict --verbose=2 "$signed_app"
 ln -s /Applications "$stage/Applications"
 

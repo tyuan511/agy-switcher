@@ -12,6 +12,12 @@ enum KeychainInteraction: Sendable {
 struct KeychainCredentialStore: Sendable {
     private static let interactionLock = Mutex(())
     let service: String
+    let useDataProtectionKeychain: Bool
+
+    init(service: String, useDataProtectionKeychain: Bool = false) {
+        self.service = service
+        self.useDataProtectionKeychain = useDataProtectionKeychain
+    }
 
     func read(_ account: String, interaction: KeychainInteraction) throws -> Data? {
         try withQuery(account, interaction: interaction) { request in
@@ -43,8 +49,146 @@ struct KeychainCredentialStore: Sendable {
             }
             var item = request
             item[kSecValueData as String] = data
+            if useDataProtectionKeychain {
+                item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+            }
             try check(SecItemAdd(item as CFDictionary, nil))
         }
+    }
+
+    /// Reads a shared `go-keyring` login-keychain item without prompting when `/usr/bin/security` owns its partition.
+    func readForGoKeyring(_ account: String, interaction: KeychainInteraction) throws -> Data? {
+        precondition(!useDataProtectionKeychain, "go-keyring reads are only used for legacy login-keychain items.")
+        do {
+            return try read(account, interaction: .disallowed)
+        } catch AGYError.keychainInteractionRequired {
+            if Self.securityCLICanReadWithoutPrompt(service: service, account: account) {
+                return try readViaSecurityCLI(account)
+            }
+            guard interaction == .allowed else { throw AGYError.keychainInteractionRequired }
+            return try read(account, interaction: .allowed)
+        }
+    }
+
+    /// Replaces a shared `go-keyring` login-keychain item via `/usr/bin/security` (`apple-tool:` partition)
+    /// so Antigravity, `agy`, and AGY Switcher share the same keychain partition without password prompts.
+    func replaceForGoKeyring(_ data: Data?, account: String) throws {
+        precondition(!useDataProtectionKeychain, "go-keyring replacement is only used for legacy login-keychain items.")
+        try withQuery(account, interaction: .disallowed) { request in
+            let deleteStatus = SecItemDelete(request as CFDictionary)
+            if deleteStatus != errSecItemNotFound && deleteStatus != errSecInteractionNotAllowed {
+                try check(deleteStatus)
+            }
+        }
+        guard let data else { return }
+        guard let secret = String(data: data, encoding: .utf8), !secret.contains("\0") else {
+            throw AGYError.unsupportedCredential
+        }
+
+        // Match `go-keyring`'s direct `/usr/bin/security` invocation (`security -i` truncates lines at 4096 bytes).
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = ["add-generic-password", "-A", "-U", "-s", service, "-a", account, "-w", secret]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw AGYError.keychain(process.terminationStatus)
+        }
+    }
+
+    private func readViaSecurityCLI(_ account: String) throws -> Data? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = ["find-generic-password", "-w", "-s", service, "-a", account]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let raw = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        if process.terminationStatus == 44 { return nil }
+        guard process.terminationStatus == 0 else {
+            throw AGYError.keychain(process.terminationStatus)
+        }
+        var trimmed = raw
+        while let last = trimmed.last, last == UInt8(ascii: "\n") || last == UInt8(ascii: "\r") {
+            trimmed.removeLast()
+        }
+        return trimmed
+    }
+
+    private static func securityCLICanReadWithoutPrompt(service: String, account: String) -> Bool {
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecUseDataProtectionKeychain as String: false,
+            kSecUseAuthenticationContext as String: context,
+            kSecReturnRef as String: true,
+        ]
+        var reference: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &reference) == errSecSuccess,
+              let reference else {
+            return false
+        }
+        var access: SecAccess?
+        // CF type `SecKeychainItem` bridges cleanly via `unsafeBitCast` after `kSecReturnRef` succeeds.
+        let item = reference as! SecKeychainItem
+        guard SecKeychainItemCopyAccess(item, &access) == errSecSuccess, let access else {
+            return false
+        }
+        var aclList: CFArray?
+        guard SecAccessCopyACLList(access, &aclList) == errSecSuccess,
+              let acls = aclList as? [SecACL] else {
+            return false
+        }
+
+        var partitionLists: [[String]] = []
+        var allowsSecurityBinary = false
+        for acl in acls {
+            let authorizations = SecACLCopyAuthorizations(acl) as? [String] ?? []
+            var applications: CFArray?
+            var description: CFString?
+            var promptSelector: SecKeychainPromptSelector = []
+            guard SecACLCopyContents(acl, &applications, &description, &promptSelector) == errSecSuccess else {
+                continue
+            }
+            if authorizations.contains(kSecACLAuthorizationPartitionID as String),
+               let hex = description as String? {
+                var bytes = Data()
+                var index = hex.startIndex
+                while hex.distance(from: index, to: hex.endIndex) >= 2 {
+                    let next = hex.index(index, offsetBy: 2)
+                    if let byte = UInt8(hex[index..<next], radix: 16) { bytes.append(byte) }
+                    index = next
+                }
+                if let plist = try? PropertyListSerialization.propertyList(from: bytes, format: nil) as? [String: Any],
+                   let partitions = plist["Partitions"] as? [String] {
+                    partitionLists.append(partitions)
+                }
+            }
+            if authorizations.contains(kSecACLAuthorizationDecrypt as String),
+               !promptSelector.contains(.requirePassphase) {
+                if applications == nil {
+                    allowsSecurityBinary = true
+                } else if let trusted = applications as? [SecTrustedApplication] {
+                    for app in trusted {
+                        var appData: CFData?
+                        if SecTrustedApplicationCopyData(app, &appData) == errSecSuccess,
+                           let data = appData as Data?,
+                           String(decoding: data, as: UTF8.self).contains("/usr/bin/security") {
+                            allowsSecurityBinary = true
+                        }
+                    }
+                }
+            }
+        }
+        let validSinglePartition = partitionLists.count == 1 && partitionLists[0].contains("apple-tool:")
+        return validSinglePartition && allowsSecurityBinary
     }
 
     private func withQuery<Result: Sendable>(
@@ -54,7 +198,16 @@ struct KeychainCredentialStore: Sendable {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
+            kSecUseDataProtectionKeychain as String: useDataProtectionKeychain,
         ]
+        if useDataProtectionKeychain {
+            if interaction == .disallowed {
+                let context = LAContext()
+                context.interactionNotAllowed = true
+                request[kSecUseAuthenticationContext as String] = context
+            }
+            return try perform(request)
+        }
         return try Self.interactionLock.withLock { _ in
             guard interaction == .disallowed else { return try perform(request) }
 
@@ -157,6 +310,40 @@ final class EncryptedCredentialVault: Sendable {
             self.read = read
             self.write = write
         }
+
+        /// Uses a primary store (Data Protection Keychain) when entitled, migrating an existing key
+        /// from the legacy login-keychain fallback once and falling back cleanly on unentitled builds.
+        static func migrating(primary: KeyStore, fallback: KeyStore) -> KeyStore {
+            KeyStore(
+                read: { account, interaction in
+                    do {
+                        if let data = try primary.read(account, interaction) {
+                            return data
+                        }
+                    } catch AGYError.keychain(errSecMissingEntitlement) {
+                        return try fallback.read(account, interaction)
+                    }
+
+                    guard let legacy = try fallback.read(account, interaction) else {
+                        return nil
+                    }
+                    // Copy into Data Protection Keychain while keeping the legacy item intact so
+                    // rollbacks or unentitled builds remain able to decrypt the local vault.
+                    try? primary.write(legacy, account, interaction)
+                    return legacy
+                },
+                write: { data, account, interaction in
+                    do {
+                        try primary.write(data, account, interaction)
+                        if data == nil {
+                            try? fallback.write(nil, account, .disallowed)
+                        }
+                    } catch AGYError.keychain(errSecMissingEntitlement) {
+                        try fallback.write(data, account, interaction)
+                    }
+                }
+            )
+        }
     }
 
     private struct State {
@@ -166,6 +353,7 @@ final class EncryptedCredentialVault: Sendable {
 
     private static let header = Data("AGYV\u{01}".utf8)
     private static let masterKeyAccount = "master-key"
+    private static let vaultService = "com.tyuan511.agy-switcher.vault"
 
     private let file: SecretFile
     private let keyStore: KeyStore
@@ -174,7 +362,10 @@ final class EncryptedCredentialVault: Sendable {
 
     init(
         directory: URL,
-        keyStore: KeyStore = KeyStore(store: KeychainCredentialStore(service: "com.tyuan511.agy-switcher.vault")),
+        keyStore: KeyStore = .migrating(
+            primary: KeyStore(store: KeychainCredentialStore(service: vaultService, useDataProtectionKeychain: true)),
+            fallback: KeyStore(store: KeychainCredentialStore(service: vaultService, useDataProtectionKeychain: false))
+        ),
         legacyStore: KeyStore? = KeyStore(store: KeychainCredentialStore(service: "com.tyuan511.agy-switcher.accounts"))
     ) {
         self.file = SecretFile(url: directory.appendingPathComponent("credentials.enc"))

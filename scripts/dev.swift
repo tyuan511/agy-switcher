@@ -23,6 +23,64 @@ func run(_ executable: String, _ arguments: [String]) throws {
     }
 }
 
+func capture(_ executable: String, _ arguments: [String]) -> Data? {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+    let output = Pipe()
+    process.standardOutput = output
+    process.standardError = FileHandle.nullDevice
+    do {
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return process.terminationStatus == 0 ? data : nil
+    } catch {
+        return nil
+    }
+}
+
+func findSigningIdentity(teamID: String) -> String? {
+    guard let data = capture("/usr/bin/security", ["find-identity", "-v", "-p", "codesigning"]),
+          let output = String(data: data, encoding: .utf8) else { return nil }
+    for line in output.split(separator: "\n") {
+        guard line.contains("Developer ID Application:"), line.contains("(\(teamID))") else { continue }
+        let parts = line.split(whereSeparator: \.isWhitespace)
+        if parts.count >= 2, parts[1].count == 40 {
+            return String(parts[1])
+        }
+    }
+    return nil
+}
+
+func findProvisioningProfile(appIdentifier: String) -> URL? {
+    let files = FileManager.default
+    if let explicit = ProcessInfo.processInfo.environment["AGY_PROVISIONING_PROFILE"], !explicit.isEmpty {
+        let url = URL(filePath: explicit)
+        if files.fileExists(atPath: url.path) { return url }
+    }
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    let directories = [
+        home.appending(path: "Library/Developer/Xcode/UserData/Provisioning Profiles", directoryHint: .isDirectory),
+        home.appending(path: "Library/MobileDevice/Provisioning Profiles", directoryHint: .isDirectory),
+    ]
+    for directory in directories {
+        guard let entries = try? files.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+        ) else { continue }
+        for url in entries where url.pathExtension == "provisionprofile" {
+            guard let xml = capture("/usr/bin/security", ["cms", "-D", "-i", url.path]),
+                  let plist = try? PropertyListSerialization.propertyList(from: xml, format: nil) as? [String: Any],
+                  let entitlements = plist["Entitlements"] as? [String: Any],
+                  entitlements["com.apple.application-identifier"] as? String == appIdentifier else {
+                continue
+            }
+            return url
+        }
+    }
+    return nil
+}
+
 @MainActor
 func quitRunningApps(bundleIdentifier: String) async throws {
     let applications = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
@@ -79,6 +137,27 @@ func buildAndLaunch() async throws {
     defer { try? files.removeItem(at: staging) }
     let stagedApp = staging.appending(path: appName, directoryHint: .isDirectory)
     try run("/usr/bin/ditto", [buildDirectory.appending(path: appName).path, stagedApp.path])
+
+    let entitlements = root.appending(path: "Config/AGYSwitcher.entitlements")
+    if let profile = findProvisioningProfile(appIdentifier: "J24Y9W38D8.dev.fastvibe.agy-switch") {
+        guard let identity = findSigningIdentity(teamID: "J24Y9W38D8") else {
+            throw DevelopmentError("Could not find a Developer ID Application signing identity for team J24Y9W38D8.")
+        }
+        let embeddedProfile = stagedApp.appending(path: "Contents/embedded.provisionprofile")
+        try? files.removeItem(at: embeddedProfile)
+        try files.copyItem(at: profile, to: embeddedProfile)
+        try run("/usr/bin/codesign", [
+            "--force", "--sign", identity,
+            "--timestamp=none", "--options", "runtime",
+            "--entitlements", entitlements.path,
+            "--generate-entitlement-der",
+            stagedApp.path,
+        ])
+        print("Embedded Developer ID provisioning profile (Data Protection Keychain enabled).")
+    } else {
+        print("Note: No Developer ID provisioning profile found; running without Data Protection Keychain.")
+    }
+
     try run("/usr/bin/codesign", [
         "--verify", "--deep", "--strict",
         "-R=anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] exists",

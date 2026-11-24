@@ -134,8 +134,19 @@ actor AccountService {
     }
 
     func switchAccount(to id: String) async throws {
+        let credential = try await prepareSwitch(to: id)
+        try completeSwitch(to: id, credential: credential)
+    }
+
+    func prepareSwitch(to id: String) async throws -> AntigravityCredential {
         let credential = try await credential(for: id, interaction: .allowed)
         try Task.checkCancellation()
+        guard try list().contains(where: { $0.id == id }) else { throw AGYError.authenticationRequired }
+        try clients.validateCurrentCredentials()
+        return credential
+    }
+
+    func completeSwitch(to id: String, credential: AntigravityCredential) throws {
         guard try list().contains(where: { $0.id == id }) else { throw AGYError.authenticationRequired }
         try clients.install(credential)
     }

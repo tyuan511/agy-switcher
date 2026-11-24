@@ -97,6 +97,7 @@ The release workflow needs these repository secrets, configured under **Settings
 | --- | --- |
 | `APPLE_CERT_P12` | Base64-encoded Developer ID Application `.p12` containing the certificate and private key |
 | `APPLE_CERT_PASSWORD` | Password set when exporting the `.p12` |
+| `APPLE_PROVISIONING_PROFILE` | (Recommended) Base64-encoded Developer ID `.provisionprofile` for `dev.fastvibe.agy-switch` to enable the macOS Data Protection Keychain without legacy ACL prompts |
 | `APPLE_API_KEY_P8` | Contents of the App Store Connect team API key `.p8` file used for notarization |
 | `APPLE_API_KEY_ID` | App Store Connect API Key ID |
 | `APPLE_API_ISSUER` | App Store Connect Issuer ID |

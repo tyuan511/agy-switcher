@@ -97,6 +97,7 @@ xcodebuild -project AGYSwitcher.xcodeproj -scheme AGYSwitcher -configuration Deb
 | --- | --- |
 | `APPLE_CERT_P12` | 包含证书和私钥的 Developer ID Application `.p12`，以 Base64 编码 |
 | `APPLE_CERT_PASSWORD` | 导出 `.p12` 时设置的密码 |
+| `APPLE_PROVISIONING_PROFILE` | （推荐）`dev.fastvibe.agy-switch` 的 Developer ID `.provisionprofile`，以 Base64 编码，用于启用 macOS Data Protection Keychain 以消除钥匙串弹窗 |
 | `APPLE_API_KEY_P8` | 用于公证的 App Store Connect 团队 API 密钥，填写 `.p8` 原文 |
 | `APPLE_API_KEY_ID` | App Store Connect API Key ID |
 | `APPLE_API_ISSUER` | App Store Connect Issuer ID |

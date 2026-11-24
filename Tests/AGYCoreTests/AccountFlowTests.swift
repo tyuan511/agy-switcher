@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import Security
 import Synchronization
 import Testing
 @testable import AGYCore
@@ -426,10 +427,16 @@ struct OAuthAndQuotaTests {
 }
 
 struct ClientCredentialTests {
-    @Test func installationUsesKeychainEnvelopeAndPrivateFiles() throws {
+    @Test(arguments: [false, true])
+    func installationUsesKeychainEnvelopeAndPrivateFiles(existingCredentials: Bool) throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
-        let credential = makeCredential("new")
+        if existingCredentials {
+            let previous = try JSONEncoder().encode(makeCredential("old"))
+            try fixture.desktop.write(previous)
+            try fixture.cli.write(previous)
+        }
+        let credential = makeCredential("new", subject: "new-account")
         try fixture.clients.install(credential)
         let system = try #require(fixture.system.read())
         #expect(system.starts(with: Data("go-keyring-base64:".utf8)))
@@ -441,6 +448,7 @@ struct ClientCredentialTests {
             let attributes = try FileManager.default.attributesOfItem(atPath: file.url.path)
             #expect(attributes[.posixPermissions] as? Int == 0o600)
         }
+        #expect(try fixture.clients.activeAccount(knownSubjects: ["new-account"], matchToken: { _ in nil }) == .managed("new-account"))
     }
 
     @Test func partialWriteRestoresPreviousCredentialAndRemovesNewFallback() throws {
@@ -504,12 +512,12 @@ struct ClientCredentialTests {
         #expect(try clients.activeAccount(knownSubjects: ["alex", "other"], matchToken: { _ in "alex" }) == .inconsistent)
     }
 
-    @Test func sharedKeychainCanPromptDuringSwitchButNotDuringStatusRead() throws {
+    @Test func sharedKeychainNeverPromptsDuringStatusReadOrSwitch() throws {
         let system = Cell()
         let clients = ClientCredentials(targets: [
             .init(keychainEncoding: true, read: { interaction in
-                guard interaction == .allowed else { throw AGYError.keychainInteractionRequired }
-                return system.read()
+                #expect(interaction == .disallowed)
+                throw AGYError.keychainInteractionRequired
             }, write: system.write),
         ])
 
@@ -595,6 +603,34 @@ struct ClientCredentialTests {
         try reopened.write(nil, account: "second-user", interaction: .allowed)
         #expect(!FileManager.default.fileExists(atPath: fileURL.path))
     }
+
+    @Test func migratingMasterKeyStoreMigratesLegacyKeyAndFallsBackWhenUnentitled() throws {
+        let primaryEntries = Mutex<[String: Data]>([:])
+        let fallbackEntries = Mutex<[String: Data]>(["master-key": Data(repeating: 7, count: 32)])
+        let primary = EncryptedCredentialVault.KeyStore(
+            read: { account, _ in primaryEntries.withLock { $0[account] } },
+            write: { data, account, _ in primaryEntries.withLock { $0[account] = data } }
+        )
+        let fallback = EncryptedCredentialVault.KeyStore(
+            read: { account, _ in fallbackEntries.withLock { $0[account] } },
+            write: { data, account, _ in fallbackEntries.withLock { $0[account] = data } }
+        )
+        let store = EncryptedCredentialVault.KeyStore.migrating(primary: primary, fallback: fallback)
+
+        let migrated = try store.read("master-key", .allowed)
+        #expect(migrated == Data(repeating: 7, count: 32))
+        #expect(primaryEntries.withLock { $0["master-key"] } == Data(repeating: 7, count: 32))
+        #expect(fallbackEntries.withLock { $0["master-key"] } == Data(repeating: 7, count: 32))
+
+        // Unentitled primary falls back transparently on both write and read.
+        let unentitledPrimary = EncryptedCredentialVault.KeyStore(
+            read: { _, _ in throw AGYError.keychain(errSecMissingEntitlement) },
+            write: { _, _, _ in throw AGYError.keychain(errSecMissingEntitlement) }
+        )
+        let unentitledStore = EncryptedCredentialVault.KeyStore.migrating(primary: unentitledPrimary, fallback: fallback)
+        try unentitledStore.write(Data(repeating: 9, count: 32), "master-key", .allowed)
+        #expect(try unentitledStore.read("master-key", .disallowed) == Data(repeating: 9, count: 32))
+    }
 }
 
 private final class Cell: Sendable {
@@ -618,15 +654,11 @@ private final class Fixture: Sendable {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
     }
 
-    var desktop: SecretFile { SecretFile(url: root.appendingPathComponent("desktop-token")) }
-    var cli: SecretFile { SecretFile(url: root.appendingPathComponent("cli/token")) }
+    var desktop: SecretFile { SecretFile(url: root.appendingPathComponent(".gemini/jetski-standalone-oauth-token")) }
+    var cli: SecretFile { SecretFile(url: root.appendingPathComponent(".gemini/antigravity-cli/antigravity-oauth-token")) }
 
     var clients: ClientCredentials {
-        ClientCredentials(targets: [
-            system.target(keychain: true),
-            .init(keychainEncoding: false, read: { _ in try self.desktop.read() }, write: desktop.write),
-            .init(keychainEncoding: false, read: { _ in try self.cli.read() }, write: cli.write),
-        ])
+        ClientCredentials(home: root, sharedKeychain: system.target(keychain: true))
     }
 
     func service(

@@ -11,13 +11,20 @@ struct ClientCredentials: Sendable {
     let targets: [Target]
 
     init(home: URL = .homeDirectory) {
+        let keychain = KeychainCredentialStore(service: "gemini")
+        self.init(home: home, sharedKeychain: Target(
+            keychainEncoding: true,
+            read: { try keychain.readForGoKeyring("antigravity", interaction: $0) },
+            write: { try keychain.replaceForGoKeyring($0, account: "antigravity") }
+        ))
+    }
+
+    init(home: URL, sharedKeychain: Target) {
         let gemini = home.appendingPathComponent(".gemini", isDirectory: true)
         let desktop = SecretFile(url: gemini.appendingPathComponent("jetski-standalone-oauth-token"))
         let cli = SecretFile(url: gemini.appendingPathComponent("antigravity-cli/antigravity-oauth-token"))
-        let keychain = KeychainCredentialStore(service: "gemini")
         targets = [
-            Target(keychainEncoding: true, read: { try keychain.read("antigravity", interaction: $0) },
-                   write: { try keychain.write($0, account: "antigravity", interaction: .allowed) }),
+            sharedKeychain,
             Target(keychainEncoding: false, read: { _ in try desktop.read() }, write: desktop.write),
             Target(keychainEncoding: false, read: { _ in try cli.read() }, write: cli.write),
         ]
@@ -60,29 +67,60 @@ struct ClientCredentials: Sendable {
         return .unmanaged
     }
 
+    func validateCurrentCredentials() throws {
+        let readOrder = targets.indices.sorted { !targets[$0].keychainEncoding && targets[$1].keychainEncoding }
+        for index in readOrder {
+            let target = targets[index]
+            let interaction: KeychainInteraction = target.keychainEncoding ? .disallowed : .allowed
+            do {
+                if let data = try target.read(interaction) {
+                    guard let current = try? Self.decode(data), current.authMethod == "consumer" else {
+                        throw AGYError.unsupportedCredential
+                    }
+                }
+            } catch AGYError.keychainInteractionRequired where target.keychainEncoding {
+                continue
+            }
+        }
+    }
+
     func install(_ credential: AntigravityCredential) throws {
+        enum PreviousValue {
+            case known(Data?)
+            case unreadable
+        }
+
         let json = try JSONEncoder().encode(credential)
         let updates = targets.map { target in
             target.keychainEncoding ? Self.keychainPrefix + json.base64EncodedData() : json
         }
-        // Validate local files before touching the keychain so unsupported credentials fail without prompting.
-        var previous = [Data?](repeating: nil, count: targets.count)
+        // Validate local files before touching the shared keychain so unsupported credentials fail early.
+        var previous = [PreviousValue](repeating: .known(nil), count: targets.count)
         let readOrder = targets.indices.sorted { !targets[$0].keychainEncoding && targets[$1].keychainEncoding }
         for index in readOrder {
-            let data = try targets[index].read(.allowed)
-            if let data {
-                guard let current = try? Self.decode(data), current.authMethod == "consumer" else {
-                    throw AGYError.unsupportedCredential
+            let target = targets[index]
+            let interaction: KeychainInteraction = target.keychainEncoding ? .disallowed : .allowed
+            do {
+                let data = try target.read(interaction)
+                if let data {
+                    guard let current = try? Self.decode(data), current.authMethod == "consumer" else {
+                        throw AGYError.unsupportedCredential
+                    }
                 }
+                previous[index] = .known(data)
+            } catch AGYError.keychainInteractionRequired where target.keychainEncoding {
+                // Another client owns the shared keychain ACL; replace it silently via /usr/bin/security.
+                previous[index] = .unreadable
             }
-            previous[index] = data
         }
 
         var attempted: [Int] = []
         do {
+            // Write the shared keychain before local files so a running client watching local files
+            // never observes updated files while the keychain still holds the previous token.
             for index in targets.indices {
-                if !targets[index].keychainEncoding {
-                    guard try targets[index].read(.allowed) == previous[index] else { throw AGYError.credentialChanged }
+                if !targets[index].keychainEncoding, case .known(let prior) = previous[index] {
+                    guard try targets[index].read(.allowed) == prior else { throw AGYError.credentialChanged }
                 }
                 attempted.append(index)
                 try targets[index].write(updates[index])
@@ -93,16 +131,18 @@ struct ClientCredentials: Sendable {
         } catch {
             var recoveryFailed = false
             for index in attempted.reversed() {
+                guard case .known(let prior) = previous[index] else { continue }
+                let interaction: KeychainInteraction = targets[index].keychainEncoding ? .disallowed : .allowed
                 do {
-                    let value = try targets[index].read(.allowed)
-                    if value == previous[index] { continue }
+                    let value = try targets[index].read(interaction)
+                    if value == prior { continue }
                     guard value == updates[index] else {
                         // Another client wrote here during the switch. Keep its newer value.
                         recoveryFailed = true
                         continue
                     }
-                    try targets[index].write(previous[index])
-                    if try targets[index].read(.allowed) != previous[index] { recoveryFailed = true }
+                    try targets[index].write(prior)
+                    if try targets[index].read(interaction) != prior { recoveryFailed = true }
                 } catch {
                     recoveryFailed = true
                 }
