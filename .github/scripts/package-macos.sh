@@ -61,7 +61,7 @@ if [[ -n "${APPLE_PROVISIONING_PROFILE:-}" ]]; then
   unset APPLE_PROVISIONING_PROFILE
   profile_plist="$work_dir/profile.plist"
   security cms -D -i "$profile" > "$profile_plist"
-  if [[ "$(plutil -extract Entitlements.com\.apple\.application-identifier raw "$profile_plist" 2>/dev/null || true)" != "J24Y9W38D8.dev.fastvibe.agy-switch" ]]; then
+  if [[ "$(/usr/libexec/PlistBuddy -c "Print :Entitlements:com.apple.application-identifier" "$profile_plist" 2>/dev/null || true)" != "J24Y9W38D8.dev.fastvibe.agy-switch" ]]; then
     echo "::error::APPLE_PROVISIONING_PROFILE does not match J24Y9W38D8.dev.fastvibe.agy-switch." >&2
     exit 1
   fi
