@@ -65,6 +65,17 @@ if [[ -n "${APPLE_PROVISIONING_PROFILE:-}" ]]; then
     echo "::error::APPLE_PROVISIONING_PROFILE does not match J24Y9W38D8.dev.fastvibe.agy-switch." >&2
     exit 1
   fi
+  if ! python3 - "$profile_plist" "$identity" <<'PY'
+import hashlib, plistlib, sys
+with open(sys.argv[1], "rb") as f:
+    plist = plistlib.load(f)
+allowed = {hashlib.sha1(cert).hexdigest().upper() for cert in plist.get("DeveloperCertificates", [])}
+sys.exit(0 if sys.argv[2].upper() in allowed else 1)
+PY
+  then
+    echo "::error::APPLE_CERT_P12 signing identity ($identity) is not authorized by APPLE_PROVISIONING_PROFILE." >&2
+    exit 1
+  fi
   codesign_args+=(--entitlements "$entitlements")
 else
   echo "::warning::APPLE_PROVISIONING_PROFILE is not set; building without Data Protection Keychain entitlements." >&2
